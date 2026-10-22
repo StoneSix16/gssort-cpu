@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>gsplat WebSocket Viewer</title>
+    <style>
+      :root { color-scheme: dark; font-family: ui-sans-serif, system-ui, sans-serif; }
+      html, body { height: 100%; overflow: hidden; }
+      body { margin: 0; background: #111827; color: #e5e7eb; }
+      main { display: grid; grid-template-columns: minmax(0, 1fr) 290px; height: 100vh; min-height: 0; overflow: hidden; }
+      section { display: flex; min-height: 0; flex-direction: column; overflow: auto; padding: 18px; }
+      .passes { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; flex: 1; min-height: 0; }
+      figure { margin: 0; display: flex; flex-direction: column; min-height: 0; }
+      figcaption { font-size: 0.85rem; margin-bottom: 8px; color: #d1d5db; }
+      .passes img { width: 100%; flex: 1; min-height: 0; object-fit: contain; background: #030712; border: 1px solid #374151; }
+      .hint { font-size: 0.75rem; color: #9ca3af; }
+      aside { min-height: 0; overflow-y: auto; background: #1f2937; border-left: 1px solid #374151; }
+      label { display: block; margin-top: 14px; font-size: 0.85rem; color: #9ca3af; }
+      input, select, button { width: 100%; box-sizing: border-box; margin-top: 6px; padding: 8px; border: 1px solid #4b5563; border-radius: 5px; background: #111827; color: #f3f4f6; }
+      button { cursor: pointer; background: #2563eb; border-color: #3b82f6; }
+      button:hover { background: #1d4ed8; }
+      button:disabled { cursor: not-allowed; opacity: 0.45; }
+      button:disabled:hover { background: #2563eb; }
+      #status { margin: 0 0 14px; color: #93c5fd; }
+      pre { white-space: pre-wrap; font-size: 0.78rem; color: #d1d5db; }
+      textarea { width: 100%; box-sizing: border-box; resize: vertical; margin-top: 6px; padding: 8px; border: 1px solid #4b5563; border-radius: 5px; background: #030712; color: #d1d5db; font: 0.75rem ui-monospace, SFMono-Regular, Consolas, monospace; }
+      h1 { font-size: 1.1rem; margin: 0 0 14px; }
+      .row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+      .button-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section>
+        <h1>gsplat WebSocket Viewer</h1>
+        <p id="status">Connecting...</p>
+        <div class="passes">
+          <figure><figcaption>Original · transmittance stop</figcaption><img id="original" alt="Original gsplat render" /></figure>
+          <figure><figcaption>Pass A · no early stop</figcaption><img id="no_early_stop" alt="Render without early termination" /></figure>
+          <figure><figcaption>Pass B · per-pixel depth stop</figcaption><img id="depth_stop" alt="Render with depth termination" /></figure>
+        </div>
+      </section>
+      <aside>
+        <label for="frame">Trajectory frame <span id="frameValue">0</span></label>
+        <input id="frame" type="range" min="0" max="0" value="0" />
+        <label for="mode">Render mode</label>
+        <select id="mode">
+          <option value="rgb">RGB</option>
+          <option value="depth">Expected depth</option>
+          <option value="depth_accumulated">Accumulated depth</option>
+          <option value="alpha">Alpha</option>
+        </select>
+        <label for="depth-mode">Pass B depth adjustment</label>
+        <select id="depth-mode">
+          <option value="offset">Add offset</option>
+          <option value="scale">Multiply by scale</option>
+        </select>
+        <label id="depth-value-label" for="depth-value">Offset (scene units)</label>
+        <input id="depth-value" type="number" step="any" value="0" />
+        <p class="hint">Uses Original expected depth before display normalization. Invalid depth keeps all contributions.</p>
+        <label for="fov">FOV Y <span id="fovValue">60</span>°</label>
+        <input id="fov" type="range" min="10" max="120" step="1" value="60" />
+        <div class="row">
+          <div><label for="width">Width</label><input id="width" type="number" min="64" value="800" /></div>
+          <div><label for="height">Height</label><input id="height" type="number" min="64" value="600" /></div>
+        </div>
+        <button id="render">Render frame</button>
+        <div class="button-row">
+          <button id="restart">Restart</button>
+          <button id="next" disabled>Next</button>
+        </div>
+        <div class="button-row">
+          <button id="reset-output">Reset output</button>
+          <button id="play" disabled>Play</button>
+        </div>
+        <label for="sort-output">Per-frame sorting output</label>
+        <textarea id="sort-output" rows="10" readonly></textarea>
+        <pre id="metrics">No render yet.</pre>
+      </aside>
+    </main>
+    <script>
+      const status = document.getElementById("status");
+      const frame = document.getElementById("frame");
+      const frameValue = document.getElementById("frameValue");
+      const mode = document.getElementById("mode");
+      const fov = document.getElementById("fov");
+      const fovValue = document.getElementById("fovValue");
+      const width = document.getElementById("width");
+      const height = document.getElementById("height");
+      const depthMode = document.getElementById("depth-mode");
+      const depthValue = document.getElementById("depth-value");
+      const depthValueLabel = document.getElementById("depth-value-label");
+      const passNames = ["original", "no_early_stop", "depth_stop"];
+      const metrics = document.getElementById("metrics");
+      const restart = document.getElementById("restart");
+      const next = document.getElementById("next");
+      const resetOutput = document.getElementById("reset-output");
+      const play = document.getElementById("play");
+      const sortOutput = document.getElementById("sort-output");
+      let socket;
+      let pendingMeta;
+      let previousUrls = [];
+      let pendingImages = [];
+      let rendering = false;
+      let renderQueued = false;
+      let depthTimer;
+      let requestId = 0;
+      let playing = false;
+      let helloReceived = false;
+
+      function updateNavigationButtons() {
+        next.disabled = playing || Number(frame.value) >= Number(frame.max);
+        restart.disabled = playing;
+        frame.disabled = playing;
+        mode.disabled = playing;
+        fov.disabled = playing;
+        width.disabled = playing;
+        height.disabled = playing;
+        depthMode.disabled = playing;
+        depthValue.disabled = playing;
+        document.getElementById("render").disabled = playing;
+      }
+
+      function appendSortingResult(message) {
+        const values = message.metrics;
+        const line = [
+          `frame=${message.frame}`,
+          `total=${values.total_gaussians}`,
+          `visible=${values.visible_gaussians}`,
+          `culled=${values.culled_gaussians}`,
+        ].join(" ");
+        sortOutput.value += `${line}\n`;
+        sortOutput.scrollTop = sortOutput.scrollHeight;
+      }
+
+      function stopPlaying() {
+        playing = false;
+        play.disabled = !helloReceived;
+        updateNavigationButtons();
+      }
+
+      function validDepthSettings() {
+        const valid = depthValue.value !== "" && depthValue.checkValidity()
+          && Number.isFinite(Number(depthValue.value));
+        if (!valid) status.textContent = "Enter a finite depth value; scale must be positive.";
+        return valid;
+      }
+
+      function startPlaying() {
+        if (!helloReceived || !socket || socket.readyState !== WebSocket.OPEN || playing) return;
+        if (!validDepthSettings()) return;
+        window.clearTimeout(depthTimer);
+        playing = true;
+        frame.value = "0";
+        frameValue.textContent = "0";
+        play.disabled = true;
+        updateNavigationButtons();
+        status.textContent = "Playing trajectory from frame 0...";
+        requestRender();
+      }
+
+      function connect() {
+        const protocol = location.protocol === "https:" ? "wss" : "ws";
+        const port = new URLSearchParams(location.search).get("ws_port") || "8765";
+        socket = new WebSocket(`${protocol}://${location.hostname}:${port}/`);
+        socket.binaryType = "arraybuffer";
+        socket.onopen = () => { status.textContent = "Connected; waiting for server settings..."; };
+        socket.onclose = () => {
+          helloReceived = false;
+          rendering = false;
+          renderQueued = false;
+          pendingMeta = undefined;
+          pendingImages = [];
+          stopPlaying();
+          status.textContent = "Disconnected; reload to reconnect";
+        };
+        socket.onerror = () => { status.textContent = "WebSocket connection error"; };
+        socket.onmessage = (event) => {
+          if (typeof event.data === "string") {
+            const message = JSON.parse(event.data);
+            if (message.type === "hello") {
+              helloReceived = true;
+              frame.max = Math.max(0, message.frames - 1);
+              width.value = message.default_width;
+              height.value = message.default_height;
+              fov.value = message.fov_y_deg;
+              fovValue.textContent = message.fov_y_deg;
+              play.disabled = false;
+              updateNavigationButtons();
+              status.textContent = `Connected: ${message.total_gaussians.toLocaleString()} Gaussians`;
+              requestRender();
+            } else if (message.type === "render_meta") {
+              pendingMeta = message;
+              pendingImages = [];
+            } else if (message.type === "error") {
+              pendingMeta = undefined;
+              pendingImages = [];
+              rendering = false;
+              renderQueued = false;
+              stopPlaying();
+              status.textContent = `Error: ${message.message}`;
+            }
+          } else if (pendingMeta) {
+            pendingImages.push(event.data);
+            if (pendingImages.length < pendingMeta.passes.length) return;
+            const completedMeta = pendingMeta;
+            const urls = pendingImages.map(data => URL.createObjectURL(
+              new Blob([data], { type: "image/png" })
+            ));
+            completedMeta.passes.forEach((name, index) => {
+              if (passNames.includes(name)) document.getElementById(name).src = urls[index];
+            });
+            previousUrls.forEach(url => URL.revokeObjectURL(url));
+            previousUrls = urls;
+            metrics.textContent = JSON.stringify(completedMeta, null, 2);
+            appendSortingResult(completedMeta);
+            status.textContent = `Rendered frame ${completedMeta.frame} · ${completedMeta.depth_mode} ${completedMeta.depth_value}`;
+            pendingMeta = undefined;
+            pendingImages = [];
+            rendering = false;
+            if (renderQueued) {
+              renderQueued = false;
+              requestRender();
+              return;
+            }
+            if (playing) {
+              const last = Number(frame.max);
+              if (completedMeta.frame < last) {
+                frame.value = String(completedMeta.frame + 1);
+                frameValue.textContent = frame.value;
+                window.setTimeout(requestRender, 0);
+              } else {
+                stopPlaying();
+                status.textContent = `Playback finished at frame ${completedMeta.frame}`;
+              }
+            }
+          }
+        };
+      }
+
+      function requestRender() {
+        if (!helloReceived || !socket || socket.readyState !== WebSocket.OPEN) return;
+        if (!validDepthSettings()) return;
+        if (rendering) {
+          renderQueued = true;
+          return;
+        }
+        rendering = true;
+        status.textContent = `Rendering frame ${frame.value}...`;
+        socket.send(JSON.stringify({
+          type: "render",
+          request_id: ++requestId,
+          frame: Number(frame.value),
+          width: Number(width.value),
+          height: Number(height.value),
+          fov_y_deg: Number(fov.value),
+          mode: mode.value,
+          depth_mode: depthMode.value,
+          depth_value: Number(depthValue.value),
+        }));
+      }
+
+      depthMode.addEventListener("change", () => {
+        window.clearTimeout(depthTimer);
+        const scale = depthMode.value === "scale";
+        depthValueLabel.textContent = scale ? "Scale (> 0)" : "Offset (scene units)";
+        depthValue.value = scale ? "1" : "0";
+        if (scale) depthValue.min = "0.000001";
+        else depthValue.removeAttribute("min");
+        requestRender();
+      });
+      depthValue.addEventListener("input", () => {
+        window.clearTimeout(depthTimer);
+        depthTimer = window.setTimeout(requestRender, 180);
+      });
+      mode.addEventListener("change", requestRender);
+      frame.addEventListener("input", () => {
+        frameValue.textContent = frame.value;
+        updateNavigationButtons();
+      });
+      fov.addEventListener("input", () => { fovValue.textContent = fov.value; });
+      fov.addEventListener("change", requestRender);
+      document.getElementById("render").addEventListener("click", requestRender);
+      resetOutput.addEventListener("click", () => { sortOutput.value = ""; });
+      play.addEventListener("click", startPlaying);
+      restart.addEventListener("click", () => {
+        frame.value = "0";
+        frameValue.textContent = "0";
+        updateNavigationButtons();
+        requestRender();
+      });
+      next.addEventListener("click", () => {
+        const current = Number(frame.value);
+        const last = Number(frame.max);
+        if (current >= last) {
+          updateNavigationButtons();
+          return;
+        }
+        frame.value = String(current + 1);
+        frameValue.textContent = frame.value;
+        updateNavigationButtons();
+        requestRender();
+      });
+      connect();
+    </script>
+  </body>
+</html>

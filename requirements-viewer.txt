@@ -1,0 +1,5 @@
+# Install in the conda environment that already contains PyTorch and gsplat.
+websockets>=12,<16
+plyfile>=1.0
+Pillow>=10
+ninja>=1.11
