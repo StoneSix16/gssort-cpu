@@ -8,12 +8,13 @@ extension lazily; CUDA_HOME and the compiler environment must be configured.
 
 from __future__ import annotations
 
-import math
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import torch
+
+from .depth_processing import ScaleFunction, build_depth_threshold_map
 
 
 @lru_cache(maxsize=1)
@@ -45,6 +46,11 @@ def rasterize_comparison(
     reference_alpha: torch.Tensor | None = None,
     depth_mode: str = "offset",
     depth_value: float = 0.0,
+    *,
+    scale_near: float = 1.1,
+    scale_far: float = 3.0,
+    scale_function: ScaleFunction | None = None,
+    depth_threshold_map: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return [1,H,W,4] RGB+D and [1,H,W,1] alpha without T termination.
 
@@ -54,13 +60,6 @@ def rasterize_comparison(
     user-provided intersection buffers. Only tile size 16 is supported.
     """
 
-    if depth_mode not in {"offset", "scale"}:
-        raise ValueError("depth_mode must be offset or scale")
-    limits = torch.finfo(torch.float32)
-    if not math.isfinite(depth_value) or abs(depth_value) > limits.max:
-        raise ValueError("depth_value must be a finite float32 value")
-    if depth_mode == "scale" and depth_value < limits.tiny:
-        raise ValueError("depth scale must be a positive normal float32 value")
     if (reference_depth is None) != (reference_alpha is None):
         raise ValueError("reference_depth and reference_alpha must be supplied together")
     width, height, tile_size = (int(info[key]) for key in ("width", "height", "tile_size"))
@@ -87,9 +86,17 @@ def rasterize_comparison(
         for tensor in (reference_depth, reference_alpha):
             if tuple(tensor.shape) != (1, height, width, 1):
                 raise ValueError("reference buffers must have shape [1,H,W,1]")
-        tensors += [reference_depth, reference_alpha]
+        if depth_threshold_map is None:
+            depth_threshold_map = build_depth_threshold_map(
+                reference_depth, mode=depth_mode, value=depth_value,
+                depth_alpha=reference_alpha, scale_near=scale_near,
+                scale_far=scale_far, scale_function=scale_function,
+            )
+        elif tuple(depth_threshold_map.shape) != (1, height, width, 1):
+            raise ValueError("depth_threshold_map must have shape [1,H,W,1]")
+        tensors += [depth_threshold_map]
     else:
-        tensors += [means.new_empty(0), means.new_empty(0)]
+        tensors += [means.new_empty(0)]
     for index, tensor in enumerate(tensors):
         expected_type = torch.int32 if index in (5, 6) else torch.float32
         if tensor.device != means.device or tensor.dtype != expected_type:
@@ -97,5 +104,5 @@ def rasterize_comparison(
     tensors = [tensor.contiguous() for tensor in tensors]
     with torch.cuda.device(means.device), torch.inference_mode():
         return tuple(_extension().rasterize(
-            *tensors, width, height, depth_stop, depth_mode == "scale", depth_value
+            *tensors, width, height, depth_stop
         ))

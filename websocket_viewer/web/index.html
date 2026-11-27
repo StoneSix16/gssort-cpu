@@ -10,7 +10,7 @@
       body { margin: 0; background: #111827; color: #e5e7eb; }
       main { display: grid; grid-template-columns: minmax(0, 1fr) 290px; height: 100vh; min-height: 0; overflow: hidden; }
       section { display: flex; min-height: 0; flex-direction: column; overflow: auto; padding: 18px; }
-      .passes { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; flex: 1; min-height: 0; }
+      .passes { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; flex: 1; min-height: 0; }
       figure { margin: 0; display: flex; flex-direction: column; min-height: 0; }
       figcaption { font-size: 0.85rem; margin-bottom: 8px; color: #d1d5db; }
       .passes img { width: 100%; flex: 1; min-height: 0; object-fit: contain; background: #030712; border: 1px solid #374151; }
@@ -39,6 +39,7 @@
           <figure><figcaption>Original · transmittance stop</figcaption><img id="original" alt="Original gsplat render" /></figure>
           <figure><figcaption>Pass A · no early stop</figcaption><img id="no_early_stop" alt="Render without early termination" /></figure>
           <figure><figcaption>Pass B · per-pixel depth stop</figcaption><img id="depth_stop" alt="Render with depth termination" /></figure>
+          <figure><figcaption>Gaussian culled · center depth</figcaption><img id="gaussian_culled" alt="Render after whole Gaussian depth culling" /></figure>
         </div>
       </section>
       <aside>
@@ -51,13 +52,21 @@
           <option value="depth_accumulated">Accumulated depth</option>
           <option value="alpha">Alpha</option>
         </select>
-        <label for="depth-mode">Pass B depth adjustment</label>
+        <label for="depth-mode">Depth adjustment · Pass B and Gaussian culled</label>
         <select id="depth-mode">
           <option value="offset">Add offset</option>
           <option value="scale">Multiply by scale</option>
+          <option value="linear">Linear depth scale</option>
         </select>
         <label id="depth-value-label" for="depth-value">Offset (scene units)</label>
         <input id="depth-value" type="number" step="any" value="0" />
+        <div id="linear-controls" hidden>
+          <label for="scale-near">Near scale</label>
+          <input id="scale-near" type="number" min="0.000001" step="any" value="1.1" />
+          <label for="scale-far">Far scale</label>
+          <input id="scale-far" type="number" min="0.000001" step="any" value="3" />
+          <p class="hint">Linear from nearest to farthest valid expected depth in this view.</p>
+        </div>
         <p class="hint">Uses Original expected depth before display normalization. Invalid depth keeps all contributions.</p>
         <label for="fov">FOV Y <span id="fovValue">60</span>°</label>
         <input id="fov" type="range" min="10" max="120" step="1" value="60" />
@@ -91,7 +100,9 @@
       const depthMode = document.getElementById("depth-mode");
       const depthValue = document.getElementById("depth-value");
       const depthValueLabel = document.getElementById("depth-value-label");
-      const passNames = ["original", "no_early_stop", "depth_stop"];
+      const scaleNear = document.getElementById("scale-near");
+      const scaleFar = document.getElementById("scale-far");
+      const passNames = ["original", "no_early_stop", "depth_stop", "gaussian_culled"];
       const metrics = document.getElementById("metrics");
       const restart = document.getElementById("restart");
       const next = document.getElementById("next");
@@ -119,6 +130,8 @@
         height.disabled = playing;
         depthMode.disabled = playing;
         depthValue.disabled = playing;
+        scaleNear.disabled = playing;
+        scaleFar.disabled = playing;
         document.getElementById("render").disabled = playing;
       }
 
@@ -129,6 +142,8 @@
           `total=${values.total_gaussians}`,
           `visible=${values.visible_gaussians}`,
           `culled=${values.culled_gaussians}`,
+          `depth_culled=${values.gaussian_depth_culling.depth_culled_gaussians}`,
+          `depth_culled/projected=${values.gaussian_depth_culling.depth_culled_over_projected}`,
         ].join(" ");
         sortOutput.value += `${line}\n`;
         sortOutput.scrollTop = sortOutput.scrollHeight;
@@ -141,6 +156,13 @@
       }
 
       function validDepthSettings() {
+        if (depthMode.value === "linear") {
+          const near = Number(scaleNear.value), far = Number(scaleFar.value);
+          const valid = scaleNear.value !== "" && scaleFar.value !== ""
+            && Number.isFinite(near) && Number.isFinite(far) && near > 0 && far >= near;
+          if (!valid) status.textContent = "Enter scales with 0 < near <= far.";
+          return valid;
+        }
         const valid = depthValue.value !== "" && depthValue.checkValidity()
           && Number.isFinite(Number(depthValue.value));
         if (!valid) status.textContent = "Enter a finite depth value; scale must be positive.";
@@ -215,7 +237,10 @@
             previousUrls = urls;
             metrics.textContent = JSON.stringify(completedMeta, null, 2);
             appendSortingResult(completedMeta);
-            status.textContent = `Rendered frame ${completedMeta.frame} · ${completedMeta.depth_mode} ${completedMeta.depth_value}`;
+            const depthSetting = completedMeta.depth_mode === "linear"
+              ? `linear ${completedMeta.scale_near} to ${completedMeta.scale_far}`
+              : `${completedMeta.depth_mode} ${completedMeta.depth_value}`;
+            status.textContent = `Rendered frame ${completedMeta.frame} · ${depthSetting}`;
             pendingMeta = undefined;
             pendingImages = [];
             rendering = false;
@@ -258,12 +283,18 @@
           mode: mode.value,
           depth_mode: depthMode.value,
           depth_value: Number(depthValue.value),
+          scale_near: depthMode.value === "linear" ? Number(scaleNear.value) : 1.1,
+          scale_far: depthMode.value === "linear" ? Number(scaleFar.value) : 3,
         }));
       }
 
       depthMode.addEventListener("change", () => {
         window.clearTimeout(depthTimer);
         const scale = depthMode.value === "scale";
+        const linear = depthMode.value === "linear";
+        document.getElementById("linear-controls").hidden = !linear;
+        depthValue.hidden = linear;
+        depthValueLabel.hidden = linear;
         depthValueLabel.textContent = scale ? "Scale (> 0)" : "Offset (scene units)";
         depthValue.value = scale ? "1" : "0";
         if (scale) depthValue.min = "0.000001";
@@ -274,6 +305,10 @@
         window.clearTimeout(depthTimer);
         depthTimer = window.setTimeout(requestRender, 180);
       });
+      [scaleNear, scaleFar].forEach(input => input.addEventListener("input", () => {
+        window.clearTimeout(depthTimer);
+        depthTimer = window.setTimeout(requestRender, 180);
+      }));
       mode.addEventListener("change", requestRender);
       frame.addEventListener("input", () => {
         frameValue.textContent = frame.value;

@@ -19,8 +19,7 @@ __global__ void render_kernel(
     const float *__restrict__ colors, const float *__restrict__ opacities,
     const float *__restrict__ depths, const int *__restrict__ offsets,
     const int *__restrict__ ids, int n_isects, int width, int height,
-    int tile_width, int tile_count, const float *__restrict__ reference_depth,
-    const float *__restrict__ reference_alpha, bool scale, float value,
+    int tile_width, int tile_count, const float *__restrict__ depth_threshold,
     float *__restrict__ output, float *__restrict__ alphas) {
     const int rank = threadIdx.y * kTile + threadIdx.x;
     const int tile = blockIdx.x;
@@ -31,10 +30,8 @@ __global__ void render_kernel(
     bool done = !inside;
     float cutoff = CUDART_INF_F;
     if (DepthStop && inside) {
-        const float depth = reference_depth[pixel];
-        if (reference_alpha[pixel] > 1e-5f && isfinite(depth) && depth > 0.f) {
-            cutoff = scale ? depth * value : depth + value;
-        }
+        const float threshold = depth_threshold[pixel];
+        if (!isnan(threshold)) cutoff = threshold;
     }
 
     __shared__ float2 xy[kBatch];
@@ -94,8 +91,8 @@ std::vector<at::Tensor> rasterize_comparison_cuda(
     const at::Tensor &means, const at::Tensor &conics, const at::Tensor &colors,
     const at::Tensor &opacities, const at::Tensor &depths,
     const at::Tensor &offsets, const at::Tensor &ids,
-    const at::Tensor &reference_depth, const at::Tensor &reference_alpha,
-    int64_t width, int64_t height, bool depth_stop, bool scale, double value) {
+    const at::Tensor &depth_threshold,
+    int64_t width, int64_t height, bool depth_stop) {
     const c10::cuda::CUDAGuard guard(means.device());
     auto output = at::empty({1, height, width, 4}, means.options());
     auto alphas = at::empty({1, height, width, 1}, means.options());
@@ -111,8 +108,7 @@ std::vector<at::Tensor> rasterize_comparison_cuda(
         depths.data_ptr<float>(), offsets.data_ptr<int>(), ids.data_ptr<int>(), \
         static_cast<int>(ids.numel()), static_cast<int>(width), \
         static_cast<int>(height), tile_width, tile_count, \
-        reference_depth.data_ptr<float>(), reference_alpha.data_ptr<float>(), \
-        scale, static_cast<float>(value), output.data_ptr<float>(), \
+        depth_threshold.data_ptr<float>(), output.data_ptr<float>(), \
         alphas.data_ptr<float>())
     if (depth_stop) {
         LAUNCH(true);

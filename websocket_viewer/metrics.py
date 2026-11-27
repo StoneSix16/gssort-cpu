@@ -29,6 +29,7 @@ from gsplat import rasterization
 from .camera import load_trajectory, make_intrinsics
 from .fragment_stats import compute_fragment_statistics_sweep
 from .scene import load_gaussian_scene
+from .depth_processing import DEPTH_MODES, validate_depth_parameters
 
 
 RESOLUTIONS = {
@@ -103,6 +104,8 @@ def _render_frame_metrics(
     intersection_chunk_size: int,
     depth_mode: str,
     depth_values: list[float],
+    scale_near: float = 1.1,
+    scale_far: float = 3.0,
 ) -> dict[str, object]:
     """Render one frame in ED mode and return JSON-compatible metrics."""
 
@@ -133,6 +136,8 @@ def _render_frame_metrics(
             meta,
             depth_mode=depth_mode,
             depth_values=depth_values,
+            scale_near=scale_near,
+            scale_far=scale_far,
             depth_alpha=render_alphas[0, ..., 0],
             alpha_threshold=alpha_threshold,
             transmittance_threshold=transmittance_threshold,
@@ -154,6 +159,8 @@ def _render_frame_metrics(
         variants.append({
             "depth_mode": stats.depth_mode,
             "depth_value": stats.depth_value,
+            "scale_near": stats.scale_near,
+            "scale_far": stats.scale_far,
             "metrics": totals,
             "ratios_over_participating": ratios,
         })
@@ -199,6 +206,8 @@ def collect_metrics(args: argparse.Namespace) -> dict[str, object]:
             intersection_chunk_size=args.intersection_chunk_size,
             depth_mode=args.depth_mode,
             depth_values=args.depth_values,
+            scale_near=args.scale_near,
+            scale_far=args.scale_far,
         )
         for frame in frames
     ]
@@ -215,6 +224,9 @@ def collect_metrics(args: argparse.Namespace) -> dict[str, object]:
         "depth_epsilon": args.depth_epsilon,
         "depth_mode": args.depth_mode,
         "depth_values": args.depth_values,
+        "scale_near": args.scale_near,
+        "scale_far": args.scale_far,
+        "depth_normalization": "valid_ED_min_max_per_view" if args.depth_mode == "linear" else None,
         "pixel_sampling": "centers_at_x_plus_0.5_y_plus_0.5",
         "would_stop_definition": "active_and_T_before_le_threshold",
         "frame_metrics": frame_metrics,
@@ -238,7 +250,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--transmittance-threshold", type=float, default=1.0e-4)
     parser.add_argument("--depth-epsilon", type=float, default=0.0)
     parser.add_argument("--intersection-chunk-size", type=int, default=512)
-    parser.add_argument("--depth-mode", choices=["scale", "offset"], default="scale")
+    parser.add_argument("--depth-mode", choices=DEPTH_MODES, default="scale")
+    parser.add_argument("--scale-near", type=float, default=1.1)
+    parser.add_argument("--scale-far", type=float, default=3.0)
     parser.add_argument("--depth-values", type=float, nargs="+", default=[1.0])
     parser.add_argument("--output", type=Path)
     return parser.parse_args()
@@ -248,6 +262,10 @@ def main() -> None:
     """Run the standalone metrics command."""
 
     args = _parse_args()
+    for value in args.depth_values:
+        validate_depth_parameters(args.depth_mode, value, args.scale_near, args.scale_far)
+    if args.depth_mode == "linear" and len(args.depth_values) != 1:
+        raise ValueError("linear mode produces one variant; omit --depth-values")
     result = collect_metrics(args)
     encoded = json.dumps(result, indent=2)
     if args.output is None:

@@ -3,7 +3,7 @@
 ## 1. 环境
 
 项目使用 Conda 环境 `gs`，并依赖已编译的 gsplat v1.5.3、PyTorch CUDA 和 CUDA Toolkit。
-三 pass viewer 还需要 Ninja 与 MSVC C++ 编译环境。第一次渲染会在
+四 pass viewer 还需要 Ninja 与 MSVC C++ 编译环境。第一次渲染会在
 `websocket_viewer/.cuda_build/` 编译独立的 CUDA 扩展；后续启动会复用构建产物。
 
 进入项目目录并激活环境：
@@ -60,9 +60,9 @@ http://127.0.0.1:8766/
 - `Reset output`：清空只读的逐帧排序输出缓冲区。
 - `Trajectory frame`：直接选择轨迹中的视角。
 - `Render mode`：选择 RGB、Expected Depth、Accumulated Depth 或 Alpha。
-- 三张图依次为 `Original`（gsplat 透射率早停）、`Pass A`（无透射率早停）、
-  `Pass B`（无透射率早停，改用逐像素深度停止）。
-- `Pass B depth adjustment`：选择 `Add offset` 或 `Multiply by scale`。
+- 四张图依次为 `Original`（gsplat 透射率早停）、`Pass A`（无透射率早停）、
+  `Pass B`（无透射率早停，改用逐像素深度停止）、`Gaussian culled`（整点深度剔除后用 gsplat 重新渲染）。
+- `Depth adjustment`：选择 `Add offset` 或 `Multiply by scale`，同时作用于 Pass B 和整点剔除。
   Offset 使用场景深度单位，默认 `0`；Scale 必须大于 `0`，切换时默认 `1`。
   修改数值后会自动更新；同一视角复用 Original、Pass A 和预处理数据。
 - `FOV Y`：调节垂直视场角，范围为 `10°–120°`；松开滑块后重新渲染当前帧。
@@ -77,7 +77,14 @@ Pass B 使用 Original 的未归一化 ED：`ED + offset` 或 `ED * scale`。
 不大于 `1e-5`、ED 非正或非有限时不执行深度停止。ED 是加权期望深度，
 因此 Pass B 通常会改变图像，并不保证与 Original 相同。
 
-深度显示模式下，三张图使用 Original 的同一深度范围映射为灰度；显示归一化
+`Gaussian culled` 在高斯中心投影位置向下取整采样 Original ED，中心 Z 严格大于阈值时移除整个高斯。
+中心越界、中心坐标或 Z 无效、参考 ED/alpha 无效时保留；相等深度保留。
+参考深度固定来自完整场景，不迭代更新。整点剔除使用相同的原始 RGB 和 gsplat 透射率早停设置。
+metrics 的 `gaussian_depth_culling` 单独报告深度剔除数、保留数和无法判定数；
+`depth_culled_over_projected` 分母是投影有效高斯数，`depth_culled_over_total` 分母是场景总点数。
+这些指标与既有的视锥剔除 `culled_gaussians` 不同。
+
+深度显示模式下，四张图使用 Original 的同一深度范围映射为灰度；显示归一化
 不参与 Pass B 判断。metrics 中 `view_cache_hit` 表示是否复用了当前视角，
 `original_ms`、`pass_a_ms` 在缓存命中时为零；首次 Pass A 耗时可能包含编译。
 
@@ -207,3 +214,72 @@ PLY 需要是标准 3DGS 格式，至少包含：
 - 浏览器显示连接错误：确认 Python 服务仍在运行，并检查 HTTP 与 WebSocket 端口是否被占用。
 - 显存不足：使用 `--max-points` 限制 Gaussian 数量，或降低 `--width` 和 `--height`。
 - 视角方向异常：优先确认轨迹 JSON 的旋转是否确实是 `x/y/z/w` 顺序，以及位姿是否表示 camera-to-world。
+
+## 9. 整高斯深度剔除实验
+
+该命令独立于 viewer，使用完整场景 RGB+ED 作为固定参考，按中心深度剔除后重渲染：
+
+```powershell
+python -m websocket_viewer.gaussian_depth_metrics `
+  --ply baseline.ply --trajectory baseline.json `
+  --frames 0-56:4 --resolution 720 --fov-y-deg 50 `
+  --depth-mode scale --depth-values 1 1.1 1.5 2 2.5 3 `
+  --output results/gaussian-center-depth/sweep-720.json
+```
+
+将 `--resolution` 和输出名改为 `1080` 可运行 540×1195；720 是 360×797。
+`--depth-mode offset --depth-values 0 0.5 1` 可运行偏移实验。
+`--frames 0` 用于单帧检查；`--image-frames 0,28,56` 选择保存对比图的视角。
+命令输出 JSON、同名 Markdown 汇总和图像目录。对比图从左到右为 Original、整点剔除结果、
+放大四倍的绝对 RGB 差异。JSON 包含逐帧计数、以投影有效点数/全场景点数为分母的剔除率、
+全图浮点 RGB MAE/MSE/PSNR，以及深度获取、筛选、子集选择加渲染的分段耗时。
+零 MSE 对应无限 PSNR，JSON 中以 `null` 表示。耗时是单次诊断观测，不构成净加速结论。
+原始实验产物保存在 Git 忽略的 `results/gaussian-center-depth/`，结论入口见 `.Codex/index.md`。
+
+## 10. 按深度变化的 scale
+
+viewer 的 `Depth adjustment` 可选择 `Linear depth scale`，近端 scale 默认 1.1，
+远端默认 3。Original 有效 ED 的最小值、最大值用于当前视角内归一化：
+`t = (ED - min) / (max - min)`，`scale = 1.1 + 1.9 * t`，阈值为 `ED * scale`。
+深度使用相机空间 Z；无效 ED/低 alpha 不参与归一化，阈值无效时保留原有贡献。
+有效深度全部相同时使用近端 scale；归一化范围可能随视角变化。
+同一阈值图用于 Pass B 和整点剔除；调整近远端参数时复用当前视角的 Original。
+
+整点剔除的独立线性运行示例：
+
+```powershell
+python -B -m websocket_viewer.gaussian_depth_metrics `
+  --ply baseline.ply --trajectory baseline.json --frames 0 --resolution 1080 `
+  --depth-mode linear --scale-near 1.1 --scale-far 3 --image-frames 0 `
+  --output results/gaussian-center-depth/frame-000-linear-1080.json
+```
+
+独立片段统计命令 `websocket_viewer.metrics` 也接受相同的 linear、scale-near 和 scale-far 参数。
+linear 模式忽略固定的 depth-value，只生成一个阈值配置，无需传 `--depth-values`。
+CLI 的 offset/scale 用法保留。新的项目上下文入口为 `.agents/index.md`。
+
+Python 接口在 `websocket_viewer.depth_processing` 中，可直接生成阈值图：
+
+```python
+from websocket_viewer.depth_processing import build_depth_threshold_map
+
+threshold = build_depth_threshold_map(
+    original_ed, depth_alpha=original_alpha, mode="linear",
+    scale_near=1.1, scale_far=3.0,
+)
+
+def quadratic_scale(normalized_depth):
+    return 1.1 + 1.9 * normalized_depth.square()
+
+threshold = build_depth_threshold_map(
+    original_ed, depth_alpha=original_alpha,
+    mode="custom", scale_function=quadratic_scale,
+)
+```
+
+自定义函数输入是与深度图同形状的归一化 Tensor，输出必须是同形状、同 dtype/device 的
+有限正 scale Tensor；单调性和端点由自定义函数保证。支持 `[H,W]`、`[I,H,W]`、
+`[I,H,W,1]`。输出阈值图与输入同形状，无效参考位置为 NaN。
+`cull_gaussians_by_depth` 和 `rasterize_comparison` 可用相同的 custom 参数，
+也可传 `depth_threshold_map=threshold` 共用已计算结果；预计算图须已包含原始 alpha 有效性掩码。
+CUDA 比较扩展现在直接读取阈值图，首次使用会自动重编译，仍需要 CUDA/MSVC/Ninja 环境。

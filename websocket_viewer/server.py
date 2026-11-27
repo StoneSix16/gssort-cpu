@@ -6,7 +6,7 @@ Usage from the project root::
 
 The process keeps the Gaussian scene on the selected device, renders requested
 trajectory frames with gsplat v1.5.3, and sends a JSON metadata message followed
-by three binary PNG messages (Original, Pass A, Pass B). The static UI is served
+by four binary PNG messages (Original, Pass A, Pass B, Gaussian culled). The static UI is served
 on the HTTP port. Extra passes are compiled lazily from the viewer's CUDA source.
 """
 
@@ -16,7 +16,6 @@ import argparse
 import asyncio
 import io
 import json
-import math
 import threading
 import time
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -34,10 +33,12 @@ from .camera import CameraPose, load_trajectory, make_intrinsics
 from .culling import cull_and_sort_gaussians
 from .scene import GaussianScene, load_gaussian_scene
 from .render_passes import rasterize_comparison
+from .gaussian_depth_culling import cull_gaussians_by_depth, render_depth_subset
+from .depth_processing import DEPTH_MODES, build_depth_threshold_map, validate_depth_parameters
 
 
 MODES = {"rgb", "depth", "depth_accumulated", "alpha"}
-PASSES = ["original", "no_early_stop", "depth_stop"]
+PASSES = ["original", "no_early_stop", "depth_stop", "gaussian_culled"]
 
 
 def _sync_cuda(device: torch.device) -> None:
@@ -98,7 +99,7 @@ class ViewerRenderer:
         self.max_height = max_height
         self.device = scene.means.device
         if self.device.type != "cuda":
-            raise ValueError("The three-pass viewer requires a CUDA device")
+            raise ValueError("The four-pass viewer requires a CUDA device")
         self._lock = threading.Lock()
         self._cache_key: tuple[int, int, int, float] | None = None
         self._cache: dict[str, Any] | None = None
@@ -117,6 +118,8 @@ class ViewerRenderer:
             "passes": PASSES,
             "depth_mode": "offset",
             "depth_value": 0.0,
+            "scale_near": 1.1,
+            "scale_far": 3.0,
         }
 
     def render(self, request: dict[str, Any]) -> tuple[dict[str, Any], list[bytes]]:
@@ -128,6 +131,8 @@ class ViewerRenderer:
         request_id = request.get("request_id")
         depth_mode = str(request.get("depth_mode", "offset"))
         depth_value = float(request.get("depth_value", 0.0 if depth_mode == "offset" else 1.0))
+        scale_near = float(request.get("scale_near", 1.1))
+        scale_far = float(request.get("scale_far", 3.0))
 
         if not 0 <= frame < len(self.poses):
             raise ValueError(f"frame must be between 0 and {len(self.poses) - 1}")
@@ -139,12 +144,9 @@ class ViewerRenderer:
             raise ValueError(f"mode must be one of {sorted(MODES)}")
         if not 1.0 < fov_y_deg < 179.0:
             raise ValueError("fov_y_deg must be between 1 and 179 degrees")
-        if depth_mode not in {"offset", "scale"}:
-            raise ValueError("depth_mode must be offset or scale")
-        if not math.isfinite(depth_value) or abs(depth_value) > torch.finfo(torch.float32).max:
-            raise ValueError("depth_value must be a finite float32 value")
-        if depth_mode == "scale" and depth_value < torch.finfo(torch.float32).tiny:
-            raise ValueError("depth scale must be a positive float32 value")
+        if depth_mode not in DEPTH_MODES:
+            raise ValueError(f"depth_mode must be one of {DEPTH_MODES}")
+        validate_depth_parameters(depth_mode, depth_value, scale_near, scale_far)
 
         with self._lock, torch.inference_mode():
             key = (frame, width, height, fov_y_deg)
@@ -206,24 +208,65 @@ class ViewerRenderer:
                     "original": (original, original_alpha), "pass_a": pass_a,
                     "depth": original_ed[..., 3:4], "info": info, "rgb": rgb,
                     "projected": projected, "culling": culling,
+                    "viewmat": viewmat, "intrinsics": intrinsics,
                 }
                 self._cache_key = key
             cache = self._cache
+            threshold_start = time.perf_counter()
+            threshold_map = build_depth_threshold_map(
+                cache["depth"], mode=depth_mode, value=depth_value,
+                depth_alpha=cache["original"][1], scale_near=scale_near, scale_far=scale_far,
+            )
+            _sync_cuda(self.device)
+            threshold_ms = (time.perf_counter() - threshold_start) * 1000.0
             pass_b_start = time.perf_counter()
             if cache["info"] is not None:
                 pass_b = rasterize_comparison(
                     cache["info"], cache["rgb"], cache["depth"],
                     cache["original"][1], depth_mode, depth_value,
+                    depth_threshold_map=threshold_map,
                 )
             else:
                 pass_b = cache["pass_a"]
             _sync_cuda(self.device)
             pass_b_ms = (time.perf_counter() - pass_b_start) * 1000.0
+            depth_cull_start = time.perf_counter()
+            if cache["info"] is not None:
+                depth_culling = cull_gaussians_by_depth(
+                    cache["info"], cache["depth"], cache["original"][1],
+                    depth_mode, depth_value,
+                    depth_threshold_map=threshold_map,
+                )
+                depth_statistics = depth_culling.statistics
+            else:
+                depth_culling = None
+                depth_statistics = {
+                    "total_gaussians": self.scene.count, "projected_gaussians": 0,
+                    "tested_gaussians": 0, "depth_culled_gaussians": 0,
+                    "retained_gaussians": 0, "outside_center_gaussians": 0,
+                    "invalid_center_gaussians": 0, "invalid_reference_gaussians": 0,
+                    "depth_culled_over_projected": None,
+                    "depth_culled_over_total": 0.0 if self.scene.count else None,
+                }
+            _sync_cuda(self.device)
+            depth_cull_ms = (time.perf_counter() - depth_cull_start) * 1000.0
+            subset_start = time.perf_counter()
+            if depth_culling is not None:
+                subset_colors, subset_alpha = render_depth_subset(
+                    self.scene, depth_culling.render_indices, cache["rgb"],
+                    cache["viewmat"], cache["intrinsics"], width, height,
+                )
+                subset_colors[..., 3:4] *= subset_alpha
+                subset_output = (subset_colors, subset_alpha)
+            else:
+                subset_output = cache["original"]
+            _sync_cuda(self.device)
+            subset_render_ms = (time.perf_counter() - subset_start) * 1000.0
             render_ms = (time.perf_counter() - render_start) * 1000.0
             culling = cache["culling"]
             projected = cache["projected"]
 
-            outputs = [cache["original"], cache["pass_a"], pass_b]
+            outputs = [cache["original"], cache["pass_a"], pass_b, subset_output]
             reference_depth = cache["original"][0][0, ..., 3:4]
             if mode == "depth":
                 reference_depth = cache["depth"][0]
@@ -257,6 +300,9 @@ class ViewerRenderer:
             "passes": PASSES,
             "depth_mode": depth_mode,
             "depth_value": depth_value,
+            "scale_near": scale_near,
+            "scale_far": scale_far,
+            "depth_normalization": "valid_ED_min_max_per_view" if depth_mode == "linear" else None,
             "format": "png",
             "metrics": {
                 "total_gaussians": self.scene.count,
@@ -268,6 +314,10 @@ class ViewerRenderer:
                 "original_ms": round(original_ms, 3),
                 "pass_a_ms": round(pass_a_ms, 3),
                 "pass_b_ms": round(pass_b_ms, 3),
+                "depth_threshold_ms": round(threshold_ms, 3),
+                "gaussian_depth_culling": depth_statistics,
+                "gaussian_depth_cull_ms": round(depth_cull_ms, 3),
+                "subset_render_ms": round(subset_render_ms, 3),
                 "render_ms": round(render_ms, 3),
                 "encode_ms": round(encode_ms, 3),
             },

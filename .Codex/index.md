@@ -1,6 +1,11 @@
 # Project documentation index
 
+New project context entry: [`.agents/index.md`](../.agents/index.md), including
+the depth-dependent scale implementation. Historical documents remain here.
+
 ## Specifications
+
+- [Gaussian center depth culling](specs/gaussian-center-depth-culling.md): whole-Gaussian filtering, fourth viewer pass and batch quality experiment.
 
 - [WebSocket viewer](specs/websocket-viewer.md): GPU-side gsplat rendering with a browser WebSocket viewer.
 - [Gaussian fragment statistics post-pass](specs/fragment-stats-postpass.md): per-tile Gaussian-pixel and Gaussian-2x2-fragment workload metrics after gsplat rendering.
@@ -11,6 +16,9 @@
 - [Project usage](../../USAGE.md): setup, viewer startup, controls, parameters, and troubleshooting.
 
 ## Task records
+
+- [Gaussian center depth culling](tasks/gaussian-center-depth-culling.md): implementation, validation and experiment state.
+- [Gaussian center depth results](tasks/gaussian-center-depth-results.md): measured point removal, image quality, conditions and artifact locations.
 
 - [WebSocket viewer implementation](tasks/websocket-viewer.md): implementation status, decisions, validation, and remaining work.
 - [Gaussian fragment statistics](tasks/fragment-stats-postpass.md): standalone metrics implementation and validation.

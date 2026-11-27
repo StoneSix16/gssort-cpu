@@ -18,6 +18,8 @@ from typing import Mapping, Sequence
 
 import torch
 
+from .depth_processing import ScaleFunction, build_depth_threshold_map
+
 
 DEFAULT_ALPHA_THRESHOLD = 1.0 / 255.0
 DEFAULT_TRANSMITTANCE_THRESHOLD = 1.0e-4
@@ -48,6 +50,8 @@ class FragmentStatistics:
     depth_epsilon: float
     depth_mode: str
     depth_value: float
+    scale_near: float = 1.1
+    scale_far: float = 3.0
 
     def totals(self) -> dict[str, dict[str, int]]:
         """Return frame totals as ordinary Python integers."""
@@ -119,7 +123,11 @@ def _fragment_pair_count(mask: torch.Tensor, fragment_size: int) -> torch.Tensor
 
 
 def postprocess_depth_map(
-    depth_map: torch.Tensor, *, mode: str = "scale", value: float = 1.0
+    depth_map: torch.Tensor, *, mode: str = "scale", value: float = 1.0,
+    depth_alpha: torch.Tensor | None = None,
+    depth_valid_mask: torch.Tensor | None = None,
+    scale_near: float = 1.1, scale_far: float = 3.0,
+    scale_function: ScaleFunction | None = None,
 ) -> torch.Tensor:
     """Return adjusted ED without mutation or display normalization.
 
@@ -127,18 +135,11 @@ def postprocess_depth_map(
     offset stays valid; validity is based on the original ED and alpha.
     """
 
-    if not depth_map.is_floating_point():
-        raise ValueError("depth_map must be floating point")
-    if mode not in {"scale", "offset"}:
-        raise ValueError("depth mode must be scale or offset")
-    limits = torch.finfo(depth_map.dtype)
-    if not math.isfinite(value) or abs(value) > limits.max:
-        raise ValueError("depth value must be finite and representable in depth_map dtype")
-    if mode == "scale" and value < limits.tiny:
-        raise ValueError("depth scale must be a positive normal value")
-    adjusted = depth_map * value if mode == "scale" else depth_map + value
-    valid = torch.isfinite(depth_map) & (depth_map > 0)
-    return torch.where(valid, adjusted, float("nan"))
+    return build_depth_threshold_map(
+        depth_map, mode=mode, value=value, depth_alpha=depth_alpha,
+        depth_valid_mask=depth_valid_mask, scale_near=scale_near,
+        scale_far=scale_far, scale_function=scale_function,
+    )
 
 
 @torch.no_grad()
@@ -148,6 +149,9 @@ def compute_fragment_statistics_sweep(
     *,
     depth_mode: str = "scale",
     depth_values: Sequence[float] = (1.0,),
+    scale_near: float = 1.1,
+    scale_far: float = 3.0,
+    scale_function: ScaleFunction | None = None,
     depth_alpha: torch.Tensor | None = None,
     depth_valid_mask: torch.Tensor | None = None,
     alpha_threshold: float = DEFAULT_ALPHA_THRESHOLD,
@@ -258,10 +262,6 @@ def compute_fragment_statistics_sweep(
     if depth_map.device != device:
         raise ValueError("depth_map must be on the same device as means2d")
     depth_valid = torch.isfinite(depth_map) & (depth_map > 0)
-    adjusted_depths = torch.stack([
-        postprocess_depth_map(depth_map, mode=depth_mode, value=value)
-        for value in depth_values
-    ])
     variant_count = len(depth_values)
 
     if depth_alpha is not None:
@@ -278,6 +278,13 @@ def compute_fragment_statistics_sweep(
         if depth_valid_mask.device != device:
             raise ValueError("depth_valid_mask must be on the same device as means2d")
         depth_valid &= depth_valid_mask
+
+    adjusted_depths = torch.stack([
+        postprocess_depth_map(
+            depth_map, mode=depth_mode, value=value, depth_valid_mask=depth_valid,
+            scale_near=scale_near, scale_far=scale_far, scale_function=scale_function,
+        ) for value in depth_values
+    ])
 
     pixel_counts = torch.zeros(
         (variant_count, image_count, tile_height, tile_width, len(METRIC_NAMES)),
@@ -396,6 +403,8 @@ def compute_fragment_statistics_sweep(
             depth_epsilon=float(depth_epsilon),
             depth_mode=depth_mode,
             depth_value=value,
+            scale_near=scale_near,
+            scale_far=scale_far,
         )
         for variant_id, value in enumerate(depth_values)
     ]
@@ -415,6 +424,9 @@ def compute_fragment_statistics(
     intersection_chunk_size: int = 512,
     depth_mode: str = "scale",
     depth_value: float = 1.0,
+    scale_near: float = 1.1,
+    scale_far: float = 3.0,
+    scale_function: ScaleFunction | None = None,
 ) -> FragmentStatistics:
     """Compute one depth variant; see ``compute_fragment_statistics_sweep``.
 
@@ -426,6 +438,7 @@ def compute_fragment_statistics(
     return compute_fragment_statistics_sweep(
         depth_map, meta,
         depth_mode=depth_mode, depth_values=(depth_value,),
+        scale_near=scale_near, scale_far=scale_far, scale_function=scale_function,
         depth_alpha=depth_alpha, depth_valid_mask=depth_valid_mask,
         alpha_threshold=alpha_threshold,
         transmittance_threshold=transmittance_threshold,
